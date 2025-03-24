@@ -5,34 +5,93 @@
 .env.development.local
 .env.test.local
 .env.production.local
+**/.env
+**/.env.local
+**/.env.*
+frontend/.env
+frontend/.env.local
+frontend/.env.*
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+/frontend/.env
+/frontend/.env.local
+/frontend/.env.*
+/frontend/.env.development.local
+/frontend/.env.test.local
+/frontend/.env.production.local
 
 # Frontend
-frontend/node_modules
-frontend/dist
-frontend/dist-ssr
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+frontend/coverage/
+frontend/.next/
+frontend/.nuxt/
+frontend/.output/
+frontend/.cache/
 
 # Backend
 backend/__pycache__/
 backend/*.pyc
+backend/*.pyo
+backend/*.pyd
+backend/.Python
 backend/.venv/
 backend/venv/
+backend/ENV/
+backend/env/
+backend/.env/
+backend/.env.local/
+backend/.env.*/
+backend/coverage/
+backend/.pytest_cache/
+backend/.mypy_cache/
 
 # IDE and Editor files
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
+*.iml
+*.iws
 .DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+.project
+.classpath
+.settings/
 
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-lerna-debug.log* 
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Build and dependency directories
+node_modules/
+.pnp/
+.pnp.js
+.yarn/
+.yarnrc
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Testing
+coverage/
+.nyc_output/
+.jest/
+
+# Misc
+.DS_Store
+*.pem
+.vercel
+.netlify 
