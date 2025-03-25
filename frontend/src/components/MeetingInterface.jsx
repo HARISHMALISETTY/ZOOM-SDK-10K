@@ -1,97 +1,186 @@
-import React, { useEffect } from "react";
-import { Box } from "@mui/material";
+import React, { useEffect, useState } from "react";
+import { Box, Button, Typography, Container, Alert } from "@mui/material";
 import axios from "axios";
-import ZoomMtg from "@zoomus/websdk";
+import './MeetingInterface.css';
 
 const MeetingInterface = ({ meetingData }) => {
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [zoomScript, setZoomScript] = useState(null);
+
   useEffect(() => {
+    const loadZoomScript = () => {
+      return new Promise((resolve, reject) => {
+        // Check if script already exists
+        const existingScript = document.querySelector('script[src*="zoom-meeting-2.18.0.min.js"]');
+        if (existingScript) {
+          resolve(existingScript);
+          return;
+        }
+
+        const script = document.createElement('script');
+        script.src = 'https://source.zoom.us/2.18.0/zoom-meeting-2.18.0.min.js';
+        script.async = true;
+        script.onload = () => {
+          setZoomScript(script);
+          resolve(script);
+        };
+        script.onerror = reject;
+        document.body.appendChild(script);
+      });
+    };
+
     const startMeeting = async () => {
       try {
         if (!meetingData) {
-          console.error("Meeting data is missing");
-          return;
+          throw new Error("Meeting data is missing");
         }
-    
-        const { meeting_id, host_email, password } = meetingData;
-    
-        // Get signature from backend
-        const signatureResponse = await axios.post(
-          "http://localhost:8000/api/meetings/signature/",
-          {
-            meetingNumber: meeting_id,
-            role: 1, // Host role
-          }
-        );
-    
-        const { signature, sdkKey } = signatureResponse.data;
-    
-        // Initialize Zoom SDK
+
+        console.log("Meeting data received:", meetingData);
+        const token = localStorage.getItem('access_token');
+        
+        if (!token) {
+          throw new Error("Authentication token is missing");
+        }
+
+        console.log("Attempting to join meeting with ID:", meetingData.id);
+
+        // Load Zoom SDK script first
+        await loadZoomScript();
+
+        // Wait for ZoomMtg to be available
+        const waitForZoomMtg = () => {
+          return new Promise((resolve) => {
+            const checkZoomMtg = () => {
+              if (window.ZoomMtg) {
+                resolve(window.ZoomMtg);
+              } else {
+                setTimeout(checkZoomMtg, 100);
+              }
+            };
+            checkZoomMtg();
+          });
+        };
+
+        const ZoomMtg = await waitForZoomMtg();
+
+        // Set up Zoom SDK
         ZoomMtg.setZoomJSLib("https://source.zoom.us/2.18.0/lib", "/av");
-        ZoomMtg.preLoadWasm();
-        ZoomMtg.prepareJssdk();
-    
-        ZoomMtg.init({
-          leaveUrl: window.location.origin + "/mentor",
-          success: () => {
-            console.log("Zoom initialized successfully");
-            ZoomMtg.join({
-              meetingNumber: meeting_id,
-              userName: "Host",
-              userEmail: host_email,
-              password: password,
-              signature: signature,
-              apiKey: sdkKey,
-              success: (response) => {
-                console.log("Meeting joined successfully", response);
-              },
-              error: (err) => {
-                console.error("Failed to join meeting:", err);
-              },
-            });
-          },
-          error: (err) => {
-            console.error("Failed to initialize Zoom:", err);
-          },
+        await ZoomMtg.preLoadWasm();
+        await ZoomMtg.prepareWebSDK();
+
+        // Get meeting join details
+        const response = await axios.get(`http://localhost:8000/api/meetings/${meetingData.id}/join/`, {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
         });
+
+        console.log("Join response:", response.data);
+
+        if (response.data.success) {
+          const { meeting_number, signature, password, user_name, api_key } = response.data;
+          
+          // Initialize Zoom SDK
+          ZoomMtg.init({
+            leaveUrl: window.location.origin,
+            success: () => {
+              console.log('Zoom SDK initialized successfully');
+              setLoading(false);
+              
+              // Create a container for the meeting
+              const meetingContainer = document.getElementById('zmmtg-root');
+              if (!meetingContainer) {
+                const container = document.createElement('div');
+                container.id = 'zmmtg-root';
+                document.body.appendChild(container);
+              }
+
+              // Join meeting with embedded view
+              ZoomMtg.join({
+                signature: signature,
+                meetingNumber: meeting_number,
+                userName: user_name,
+                apiKey: api_key,
+                passWord: password,
+                success: () => {
+                  console.log('Meeting joined successfully');
+                  // Set the meeting container to be visible
+                  const container = document.getElementById('zmmtg-root');
+                  if (container) {
+                    container.style.display = 'block';
+                    container.style.position = 'fixed';
+                    container.style.top = '0';
+                    container.style.left = '0';
+                    container.style.width = '100%';
+                    container.style.height = '100%';
+                    container.style.zIndex = '9999';
+                  }
+                },
+                error: (error) => {
+                  console.error('Error joining meeting:', error);
+                  setError('Failed to join meeting');
+                }
+              });
+            },
+            error: (error) => {
+              console.error('Error initializing Zoom SDK:', error);
+              setError('Failed to initialize Zoom SDK');
+            }
+          });
+        } else {
+          throw new Error(response.data.error || 'Failed to join meeting');
+        }
       } catch (error) {
         console.error("Error in startMeeting:", error);
+        console.error("Error response:", error.response?.data);
+        console.error("Error status:", error.response?.status);
+        setError(error.response?.data?.error || error.message || "Failed to join meeting");
+        setLoading(false);
       }
     };
 
     startMeeting();
 
-    // Cleanup
+    // Cleanup function
     return () => {
-      try {
-        if (window.ZoomMtg) {
-          window.ZoomMtg.leaveMeeting({});
-        }
-        // Remove Zoom scripts
-        const scripts = document.querySelectorAll('script[src*="zoom"]');
-        scripts.forEach(script => script.remove());
-      } catch (error) {
-        console.error("Error during cleanup:", error);
+      if (zoomScript && zoomScript.parentNode) {
+        zoomScript.parentNode.removeChild(zoomScript);
+      }
+      // Clean up the meeting container
+      const container = document.getElementById('zmmtg-root');
+      if (container) {
+        container.remove();
       }
     };
   }, [meetingData]);
 
+  if (loading) {
+    return (
+      <Container>
+        <Box sx={{ mt: 4, textAlign: 'center' }}>
+          <Typography variant="h6">Loading meeting interface...</Typography>
+        </Box>
+      </Container>
+    );
+  }
+
+  if (error) {
+    return (
+      <Container>
+        <Box sx={{ mt: 4 }}>
+          <Alert severity="error">{error}</Alert>
+        </Box>
+      </Container>
+    );
+  }
+
   return (
-    <Box sx={{ 
-      width: '100%', 
-      height: 'calc(100vh - 64px)', // Subtract the height of the AppBar
-      position: 'relative',
-      overflow: 'hidden',
-      backgroundColor: '#fff'
-    }}>
-      <Box id="zmmtg-root" sx={{ 
-        width: '100%', 
-        height: '100%',
-        position: 'absolute',
-        top: 0,
-        left: 0,
-        zIndex: 1000
-      }} />
-    </Box>
+    <Container>
+      <Box sx={{ mt: 4 }}>
+        <Typography variant="h6">Meeting interface loaded</Typography>
+      </Box>
+    </Container>
   );
 };
 

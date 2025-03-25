@@ -100,12 +100,12 @@ const MentorDashboard = () => {
   const fetchRecordings = async () => {
     try {
       const token = localStorage.getItem('access_token');
-      const response = await axios.get('http://localhost:8000/api/meetings/recordings/list/', {
+      const response = await axios.get('http://localhost:8000/api/meetings/recordings/', {
         headers: {
           'Authorization': `Bearer ${token}`
         }
       });
-      setRecordings(response.data.recordings);
+      setRecordings(response.data.recordings || []);
     } catch (error) {
       console.error('Error fetching recordings:', error);
       setError('Failed to fetch recordings');
