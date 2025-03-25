@@ -78,7 +78,19 @@ const MentorDashboard = () => {
           'Authorization': `Bearer ${token}`
         }
       });
-      setMeetings(response.data);
+      
+      // Filter out past meetings
+      const currentTime = new Date();
+      const upcomingMeetings = response.data.filter(meeting => 
+        new Date(meeting.start_time) > currentTime
+      );
+      
+      // Sort meetings by start time (earliest first)
+      upcomingMeetings.sort((a, b) => 
+        new Date(a.start_time) - new Date(b.start_time)
+      );
+      
+      setMeetings(upcomingMeetings);
     } catch (error) {
       console.error('Error fetching meetings:', error);
       setError('Failed to fetch meetings');
@@ -234,27 +246,35 @@ const MentorDashboard = () => {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {meetings.map((meeting) => (
-                      <TableRow key={meeting.id}>
-                        <TableCell>{meeting.topic}</TableCell>
-                        <TableCell>{meeting.batch_name}</TableCell>
-                        <TableCell>
-                          {meeting.start_time
-                            ? new Date(meeting.start_time).toLocaleString()
-                            : 'N/A'}
-                        </TableCell>
-                        <TableCell>{meeting.duration} minutes</TableCell>
-                        <TableCell>
-                          <Button
-                            variant="outlined"
-                            color="primary"
-                            onClick={() => handleJoinMeeting(meeting)}
-                          >
-                            Join Class
-                          </Button>
+                    {meetings.length > 0 ? (
+                      meetings.map((meeting) => (
+                        <TableRow key={meeting.id}>
+                          <TableCell>{meeting.topic}</TableCell>
+                          <TableCell>{meeting.batch_name}</TableCell>
+                          <TableCell>
+                            {meeting.start_time
+                              ? new Date(meeting.start_time).toLocaleString()
+                              : 'N/A'}
+                          </TableCell>
+                          <TableCell>{meeting.duration} minutes</TableCell>
+                          <TableCell>
+                            <Button
+                              variant="outlined"
+                              color="primary"
+                              onClick={() => handleJoinMeeting(meeting)}
+                            >
+                              Join Class
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    ) : (
+                      <TableRow>
+                        <TableCell colSpan={5} align="center">
+                          No upcoming classes scheduled
                         </TableCell>
                       </TableRow>
-                    ))}
+                    )}
                   </TableBody>
                 </Table>
               </TableContainer>
