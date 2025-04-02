@@ -1,103 +1,123 @@
 import React, { useEffect, useState } from 'react';
-import { Box, Button, TextField, Typography, Container } from '@mui/material';
-import { zoomConfig, generateSignature } from '../config/zoomConfig';
+import { Box, CircularProgress, Alert } from '@mui/material';
 
-const ZoomMeeting = () => {
-  const [meetingNumber, setMeetingNumber] = useState('');
-  const [userName, setUserName] = useState('');
-  const [isJoined, setIsJoined] = useState(false);
+const ZoomMeeting = ({ meeting }) => {
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Initialize Zoom Web SDK
-    const script = document.createElement('script');
-    script.src = 'https://source.zoom.us/2.18.0/zoom-meeting-2.18.0.min.js';
-    script.async = true;
-    document.body.appendChild(script);
+    const startMeeting = async () => {
+      try {
+        if (!meeting) {
+          throw new Error('Meeting data is missing');
+        }
 
-    return () => {
-      document.body.removeChild(script);
-    };
-  }, []);
+        // Check for required environment variables
+        const zoomClientId = import.meta.env.VITE_ZOOM_CLIENT_ID;
+        if (!zoomClientId) {
+          throw new Error('Zoom Client ID is not configured. Please check your environment variables.');
+        }
 
-  const joinMeeting = async () => {
-    try {
-      const signature = await generateSignature(meetingNumber, 0); // 0 for attendee
-      zoomConfig.meetingNumber = meetingNumber;
-      zoomConfig.userName = userName;
-      zoomConfig.signature = signature;
+        console.log('Starting meeting with data:', meeting);
+        console.log('Using Zoom Client ID:', zoomClientId);
 
-      const { ZoomMtg } = window;
-      ZoomMtg.setZoomJSLib('https://source.zoom.us/2.18.0/lib', '/av');
-      ZoomMtg.preLoadWasm();
-      ZoomMtg.prepareWebSDK();
-
-      ZoomMtg.init({
-        leaveUrl: window.location.origin,
-        success: (success) => {
-          console.log('Init success:', success);
-          ZoomMtg.join({
-            signature: zoomConfig.signature,
-            meetingNumber: zoomConfig.meetingNumber,
-            userName: zoomConfig.userName,
-            apiKey: zoomConfig.apiKey,
-            passWord: zoomConfig.passWord,
-            success: (joinSuccess) => {
-              console.log('Join success:', joinSuccess);
-              setIsJoined(true);
-            },
-            error: (error) => {
-              console.error('Join error:', error);
-            },
+        // Wait for ZoomMtg to be available
+        const waitForZoomMtg = () => {
+          return new Promise((resolve) => {
+            const checkZoomMtg = () => {
+              if (window.ZoomMtg) {
+                resolve(window.ZoomMtg);
+              } else {
+                setTimeout(checkZoomMtg, 100);
+              }
+            };
+            checkZoomMtg();
           });
-        },
-        error: (error) => {
-          console.error('Init error:', error);
-        },
-      });
-    } catch (error) {
-      console.error('Error joining meeting:', error);
-    }
-  };
+        };
+
+        const ZoomMtg = await waitForZoomMtg();
+        console.log('ZoomMtg loaded');
+
+        // Set up Zoom SDK
+        ZoomMtg.setZoomJSLib('https://source.zoom.us/2.18.0/lib', '/av');
+        await ZoomMtg.preLoadWasm();
+        await ZoomMtg.prepareWebSDK();
+        console.log('Zoom SDK prepared');
+
+        // Get meeting token from backend
+        const backendUrl = import.meta.env.VITE_BACKEND_URL;
+        const response = await fetch(`${backendUrl}/api/meetings/${meeting.meeting_id}/start-token`);
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.detail || 'Failed to get meeting token');
+        }
+        const data = await response.json();
+        console.log('Received meeting token data:', data);
+
+        // Initialize Zoom SDK
+        ZoomMtg.init({
+          leaveUrl: window.location.origin,
+          success: () => {
+            console.log('Zoom SDK initialized successfully');
+            
+            // Join meeting
+            ZoomMtg.join({
+              signature: data.signature,
+              meetingNumber: data.meeting_number,
+              userName: data.host_name || 'Host',
+              apiKey: zoomClientId,
+              passWord: data.password || '',
+              success: () => {
+                console.log('Meeting joined successfully');
+                setLoading(false);
+              },
+              error: (error) => {
+                console.error('Error joining meeting:', error);
+                setError('Failed to join meeting: ' + (error.message || 'Unknown error'));
+              }
+            });
+          },
+          error: (error) => {
+            console.error('Error initializing Zoom SDK:', error);
+            setError('Failed to initialize Zoom SDK: ' + (error.message || 'Unknown error'));
+          }
+        });
+      } catch (error) {
+        console.error('Error in startMeeting:', error);
+        setError(error.message);
+      }
+    };
+
+    startMeeting();
+
+    // Cleanup function
+    return () => {
+      if (window.ZoomMtg) {
+        window.ZoomMtg.leaveMeeting();
+      }
+    };
+  }, [meeting]);
+
+  if (error) {
+    return (
+      <Box sx={{ p: 2 }}>
+        <Alert severity="error">{error}</Alert>
+      </Box>
+    );
+  }
+
+  if (loading) {
+    return (
+      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%' }}>
+        <CircularProgress />
+      </Box>
+    );
+  }
 
   return (
-    <Container maxWidth="sm">
-      <Box sx={{ mt: 4, display: 'flex', flexDirection: 'column', gap: 2 }}>
-        <Typography variant="h4" component="h1" gutterBottom>
-          Join Zoom Meeting
-        </Typography>
-        
-        {!isJoined ? (
-          <>
-            <TextField
-              label="Meeting Number"
-              value={meetingNumber}
-              onChange={(e) => setMeetingNumber(e.target.value)}
-              fullWidth
-              required
-            />
-            <TextField
-              label="Your Name"
-              value={userName}
-              onChange={(e) => setUserName(e.target.value)}
-              fullWidth
-              required
-            />
-            <Button
-              variant="contained"
-              color="primary"
-              onClick={joinMeeting}
-              disabled={!meetingNumber || !userName}
-            >
-              Join Meeting
-            </Button>
-          </>
-        ) : (
-          <Typography variant="h6" color="success.main">
-            You are now in the meeting!
-          </Typography>
-        )}
-      </Box>
-    </Container>
+    <Box sx={{ height: '100%', width: '100%' }}>
+      <div id="zmmtg-root"></div>
+    </Box>
   );
 };
 

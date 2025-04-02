@@ -70,7 +70,7 @@ const MeetingInterface = ({ meetingData }) => {
         await ZoomMtg.prepareWebSDK();
 
         // Get meeting join details
-        const response = await axios.get(`http://localhost:8000/api/meetings/${meetingData.id}/join/`, {
+        const response = await axios.get(`http://localhost:8001/api/meetings/${meetingData.meeting_id}/start-token`, {
           headers: {
             'Authorization': `Bearer ${token}`
           }
@@ -78,8 +78,8 @@ const MeetingInterface = ({ meetingData }) => {
 
         console.log("Join response:", response.data);
 
-        if (response.data.success) {
-          const { meeting_number, signature, password, user_name, api_key } = response.data;
+        if (response.data) {
+          const { signature, meeting_number } = response.data;
           
           // Initialize Zoom SDK
           ZoomMtg.init({
@@ -100,9 +100,9 @@ const MeetingInterface = ({ meetingData }) => {
               ZoomMtg.join({
                 signature: signature,
                 meetingNumber: meeting_number,
-                userName: user_name,
-                apiKey: api_key,
-                passWord: password,
+                userName: 'Host',
+                apiKey: import.meta.env.VITE_ZOOM_CLIENT_ID,
+                passWord: meetingData.password || '',
                 success: () => {
                   console.log('Meeting joined successfully');
                   // Set the meeting container to be visible
@@ -129,7 +129,7 @@ const MeetingInterface = ({ meetingData }) => {
             }
           });
         } else {
-          throw new Error(response.data.error || 'Failed to join meeting');
+          throw new Error('Failed to get meeting details');
         }
       } catch (error) {
         console.error("Error in startMeeting:", error);
@@ -184,4 +184,4 @@ const MeetingInterface = ({ meetingData }) => {
   );
 };
 
-export default MeetingInterface;
+export default MeetingInterface; 
