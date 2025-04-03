@@ -1008,7 +1008,84 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
         logger.error(f"Error processing webhook: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/webhooks/zoom/test")
+async def test_webhook(db: Session = Depends(get_db)):
+    """Test endpoint for webhook that simulates a recording completion event"""
+    try:
+        # Simulate a recording completion webhook payload
+        test_payload = {
+            "event": "recording.completed",
+            "payload": {
+                "object": {
+                    "id": "123456789",
+                    "topic": "Test Meeting",
+                    "host_id": "test_host",
+                    "host_name": "Test Host",
+                    "start_time": "2024-01-01T00:00:00Z",
+                    "uuid": "test-uuid-123",
+                    "recording_files": [
+                        {
+                            "id": "rec_123",
+                            "status": "completed",
+                            "file_type": "MP4",
+                            "file_extension": ".mp4",
+                            "file_size": 1024,
+                            "recording_start": "2024-01-01T00:00:00Z",
+                            "recording_end": "2024-01-01T01:00:00Z",
+                            "recording_type": "shared_screen_with_speaker_view",
+                            "download_url": "https://example.com/download"
+                        }
+                    ]
+                }
+            }
+        }
+        
+        # Get access token
+        access_token = get_access_token()
+        
+        # Process the test recording
+        result = process_recording_file(
+            test_payload["payload"]["object"]["recording_files"][0],
+            test_payload["payload"]["object"],
+            test_payload["payload"]["object"]["host_name"],
+            access_token,
+            db,
+            s3_uploader
+        )
+        
+        return {
+            "message": "Test webhook processed successfully",
+            "result": result
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing test webhook: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing test webhook: {str(e)}"
+        )
+
 if __name__ == "__main__":
     import uvicorn
+    import subprocess
+    import threading
+    import time
+    
+    def start_ngrok():
+        try:
+            # Start ngrok in a separate process
+            subprocess.run(['ngrok', 'http', '8001'])
+        except Exception as e:
+            logger.error(f"Error starting ngrok: {str(e)}")
+    
+    # Start ngrok in a separate thread
+    ngrok_thread = threading.Thread(target=start_ngrok)
+    ngrok_thread.daemon = True  # This ensures the thread will be killed when the main program exits
+    ngrok_thread.start()
+    
+    # Give ngrok a moment to start
+    time.sleep(2)
+    
+    # Start the FastAPI server
     logger.info("Starting Zoom Recordings API server")
     uvicorn.run(app, host="0.0.0.0", port=8001) 
