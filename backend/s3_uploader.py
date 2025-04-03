@@ -98,6 +98,7 @@ class ZoomRecordingS3Uploader:
             logger.error(f"Error uploading to S3: {str(e)}")
             raise
 
+    
     def check_file_exists(self, bucket_name: str, key: str) -> bool:
         """Check if a file exists in S3 bucket"""
         try:
@@ -111,7 +112,7 @@ class ZoomRecordingS3Uploader:
                 return False
             logger.error(f"Error checking file existence in S3: {str(e)}")
             raise
-
+        
     def list_s3_videos(self, bucket_name: str) -> list:
         """List all video files in S3 bucket"""
         try:
@@ -137,26 +138,7 @@ class ZoomRecordingS3Uploader:
         except Exception as e:
             logger.error(f"Error listing S3 videos: {str(e)}")
             return []
-
-    def estimate_storage_cost(self, file_size_bytes):
-        """
-        Estimate S3 storage costs
-        
-        :param file_size_bytes: Size of the file in bytes
-        :return: Estimated monthly storage cost
-        """
-        # Convert bytes to GB
-        file_size_gb = file_size_bytes / (1024 ** 3)
-        
-        # S3 Standard pricing (as of 2024, may vary)
-        # First 50 TB / month is $0.023 per GB
-        monthly_cost = file_size_gb * 0.023
-        
-        return {
-            'file_size_gb': round(file_size_gb, 2),
-            'estimated_monthly_cost': f"${monthly_cost:.2f}"
-        }
-
+   
     def generate_presigned_url(self, bucket_name: str, key: str, expiration: int = 3600) -> str:
         """Generate a pre-signed URL for accessing an object"""
         try:
@@ -174,3 +156,5 @@ class ZoomRecordingS3Uploader:
         except Exception as e:
             logger.error(f"Error generating pre-signed URL: {str(e)}")
             raise 
+        
+        

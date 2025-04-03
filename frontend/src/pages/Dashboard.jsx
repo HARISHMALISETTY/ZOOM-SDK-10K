@@ -10,12 +10,11 @@ import Snackbar from '@mui/material/Snackbar';
 import Alert from '@mui/material/Alert';
 
 function Dashboard() {
-  const [stats, setStats] = useState({
-    totalRecordings: 0,
-   
+  const [stats, setStats] = useState({   
     totalStorage: 0,
     totalHosts: 0
   });
+  const [recordings, setRecordings] = useState([]); 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
@@ -24,7 +23,9 @@ function Dashboard() {
   const fetchStats = async () => {
     try {
       const response = await axios.get('http://localhost:8001/api/recordings/stats');
+      console.log(response.data)
       setStats(response.data);
+      setRecordings(response.data.recordingsByTopic.length);
       setError(null);
     } catch (err) {
       setError('Failed to fetch statistics');
@@ -122,7 +123,7 @@ function Dashboard() {
             <VideoLibraryIcon sx={{ fontSize: 40, mr: 2, color: 'primary.main' }} />
             <Box>
               <Typography variant="h6">Total Recordings</Typography>
-              <Typography variant="h4">{stats.totalRecordings}</Typography>
+              <Typography variant="h4">{recordings}</Typography>
             </Box>
           </Paper>
         </Grid>

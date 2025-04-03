@@ -228,9 +228,145 @@ async def get_recording_by_id(
     Get a specific recording by ID
     """
     recording = db.query(Recording).filter(Recording.recording_id == recording_id).first()
-    if not recording:
+    if not recording: 
         raise HTTPException(status_code=404, detail="Recording not found")
     return recording
+
+def process_recording_file(recording: dict, meeting: dict, host_name: str, access_token: str, db: Session, s3_uploader: ZoomRecordingS3Uploader) -> dict:
+    """Shared function to process a single recording file"""
+    try:
+        recording_id = recording.get('id', '')
+        meeting_topic = meeting.get('topic', '')
+        meeting_id = str(meeting.get('id', ''))
+        
+        # Check if recording already exists
+        existing_recording = db.query(Recording).filter(Recording.recording_id == recording_id).first()
+        if existing_recording:
+            logger.info(f"Recording {recording_id} already exists in database, skipping...")
+            return {
+                'id': recording_id,
+                'topic': meeting_topic,
+                'status': 'skipped'
+            }
+        
+        # Create or update meeting in database
+        db_meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
+        if not db_meeting:
+            logger.info(f"Creating new meeting record: {meeting_topic}")
+            db_meeting = Meeting(
+                meeting_id=meeting_id,
+                topic=meeting_topic,
+                host_id=meeting.get('host_id', ''),
+                start_time=datetime.fromisoformat(meeting.get('start_time', '').replace("Z", "+00:00")),
+                uuid=meeting.get('uuid', '')
+            )
+            db.add(db_meeting)
+            db.commit()
+            db.refresh(db_meeting)
+            logger.info(f"Created new meeting record: {meeting_topic}")
+        
+        # Store the recording in database
+        db_recording = Recording(
+            meeting_id=db_meeting.id,
+            recording_id=recording_id,
+            topic=meeting_topic,
+            host_name=host_name,
+            file_type=recording.get('file_type', 'MP4'),
+            file_extension=recording.get('file_extension', '.mp4'),
+            file_size=recording.get('file_size', 0),
+            recording_start=datetime.fromisoformat(recording.get('recording_start', '').replace("Z", "+00:00")),
+            recording_end=datetime.fromisoformat(recording.get('recording_end', '').replace("Z", "+00:00")),
+            recording_type=recording.get('recording_type', 'shared_screen_with_speaker_view'),
+            file_path=f"recordings/{meeting.get('uuid', '')}/{recording_id}.mp4",
+            status='pending'
+        )
+        db.add(db_recording)
+        db.commit()
+        logger.info(f"Added new recording to database: {recording_id}")
+        
+        # Process the recording file
+        s3_key = db_recording.file_path
+        file_extension = recording.get('file_extension', '').upper()
+        logger.info(f"Processing file with extension: {file_extension}")
+        
+        if file_extension == 'MP4' and not s3_uploader.check_file_exists(os.getenv('AWS_BUCKET_NAME'), s3_key):
+            try:
+                download_url = recording.get('download_url')
+                if not download_url:
+                    logger.warning(f"No download URL found for recording: {recording_id}")
+                    return {
+                        'id': recording_id,
+                        'topic': meeting_topic,
+                        'status': 'error',
+                        'error': 'No download URL found'
+                    }
+
+                download_url = f"{download_url}?access_token={access_token}"
+                logger.info(f"Downloading recording: {recording_id}")
+                
+                downloaded_file = s3_uploader.download_zoom_recording(download_url)
+                if downloaded_file:
+                    logger.info(f"Successfully downloaded recording: {recording_id}")
+                    
+                    try:
+                        s3_uploader.upload_to_s3(
+                            bucket_name=os.getenv('AWS_BUCKET_NAME'),
+                            file_path=downloaded_file,
+                            recording_data=recording
+                        )
+                        logger.info(f"Successfully uploaded to S3: {s3_key}")
+                        
+                        db_recording.status = 'completed'
+                        db.commit()
+                        
+                        return {
+                            'id': recording_id,
+                            'topic': meeting_topic,
+                            'status': 'processed'
+                        }
+                        
+                    finally:
+                        if os.path.exists(downloaded_file):
+                            os.remove(downloaded_file)
+                            logger.info(f"Cleaned up downloaded file: {downloaded_file}")
+            except Exception as e:
+                logger.error(f"Error processing recording {recording_id}: {str(e)}")
+                db_recording.status = 'error'
+                db_recording.error_message = str(e)
+                db.commit()
+                return {
+                    'id': recording_id,
+                    'topic': meeting_topic,
+                    'status': 'error',
+                    'error': str(e)
+                }
+        else:
+            if file_extension != 'MP4':
+                logger.info(f"Skipping non-MP4 file: {recording_id} with extension {file_extension}")
+                return {
+                    'id': recording_id,
+                    'topic': meeting_topic,
+                    'status': 'skipped',
+                    'reason': 'Non-MP4 file'
+                }
+            else:
+                db_recording.status = 'completed'
+                db.commit()
+                logger.info(f"Recording {recording_id} already exists in S3, updated status to completed")
+                return {
+                    'id': recording_id,
+                    'topic': meeting_topic,
+                    'status': 'processed'
+                }
+                
+    except Exception as e:
+        logger.error(f"Error in process_recording_file: {str(e)}")
+        return {
+            'id': recording_id,
+            'topic': meeting_topic,
+            'status': 'error',
+            'error': str(e)
+        }
 
 @app.post("/api/recordings/process")
 async def process_recordings(db: Session = Depends(get_db)):
@@ -238,36 +374,28 @@ async def process_recordings(db: Session = Depends(get_db)):
         logger.info("Starting recordings processing workflow")
         
         # Get access token for Zoom API
-        logger.info("Requesting access token from Zoom API")
         access_token = get_access_token()
         headers = {
             'Authorization': f'Bearer {access_token}',
             'Content-Type': 'application/json'
         }
-        logger.info("Successfully obtained access token")
         
         # Get user information
-        logger.info("Fetching user information from Zoom")
         user_url = "https://api.zoom.us/v2/users/me"
         user_response = requests.get(user_url, headers=headers)
         if user_response.status_code != 200:
-            logger.error(f"Failed to get user info: {user_response.text}")
             raise HTTPException(
                 status_code=user_response.status_code,
                 detail=f"Failed to get user info: {user_response.text}"
             )
-            
+        
         user_data = user_response.json()
         user_id = user_data['id']
-        logger.info(f"Successfully got user info for user ID: {user_id}")
         
         # Get recordings list
-        logger.info("Fetching recordings list from Zoom")
         recordings_url = f"https://api.zoom.us/v2/users/{user_id}/recordings"
         recordings_response = requests.get(recordings_url, headers=headers)
-        
         if recordings_response.status_code != 200:
-            logger.error(f"Failed to get recordings: {recordings_response.text}")
             raise HTTPException(
                 status_code=recordings_response.status_code,
                 detail=f"Failed to get recordings: {recordings_response.text}"
@@ -281,179 +409,24 @@ async def process_recordings(db: Session = Depends(get_db)):
         skipped_recordings = []
         
         for meeting in meetings:
-            # Log complete meeting object from Zoom
-            logger.info("=" * 50)
-            logger.info("COMPLETE ZOOM MEETING OBJECT:")
-            logger.info(f"{meeting}")
-            logger.info("=" * 50)
-            
             meeting_topic = meeting.get('topic', '')
-            meeting_id = str(meeting.get('id', ''))
             host_id = meeting.get('host_id', '')
             
             # Get host information
             host_info = get_host_info(host_id, access_token)
-            if host_info:
-                host_name = f"{host_info.get('first_name', '')} {host_info.get('last_name', '')}".strip()
-                logger.info(f"Host name from Zoom API: {host_name}")
-            else:
-                host_name = meeting.get('host_name', 'Unknown')
-                logger.warning(f"Could not get host info, using fallback: {host_name}")
-            
-            logger.info(f"Processing meeting: {meeting_topic} (ID: {meeting_id})")
-            
-            # Create or update meeting in database
-            db_meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
-            if not db_meeting:
-                logger.info(f"Creating new meeting record: {meeting_topic}")
-                db_meeting = Meeting(
-                    meeting_id=meeting_id,
-                    topic=meeting_topic,
-                    host_id=host_id,
-                    start_time=datetime.strptime(meeting.get('start_time', ''), "%Y-%m-%dT%H:%M:%SZ"),
-                    uuid=meeting.get('uuid', '')
-                )
-                db.add(db_meeting)
-                db.commit()
-                db.refresh(db_meeting)
-                logger.info(f"Created new meeting record: {meeting_topic}")
-            else:
-                logger.info(f"Found existing meeting record: {meeting_topic}")
+            host_name = f"{host_info.get('first_name', '')} {host_info.get('last_name', '')}".strip() if host_info else meeting.get('host_name', 'Unknown')
             
             recording_files = meeting.get('recording_files', [])
-            logger.info(f"Found {len(recording_files)} recording files for meeting: {meeting_topic}")
-            
             for recording in recording_files:
-                # Only process completed recordings
                 if recording.get('status') != 'completed':
-                    logger.info(f"Skipping recording {recording.get('id')} - status: {recording.get('status')}")
                     continue
-                
-                recording_id = recording.get('id', '')
-                logger.info(f"Processing completed recording: {recording_id}")
-                
-                # Check if recording already exists
-                existing_recording = db.query(Recording).filter(Recording.recording_id == recording_id).first()
-                if existing_recording:
-                    logger.info(f"Recording {recording_id} already exists in database, skipping...")
-                    skipped_recordings.append({
-                        'id': recording_id,
-                        'topic': meeting_topic,
-                        'status': 'skipped'
-                    })
-                    continue
-                
-                # Store the recording in database
-                file_type = recording.get('file_type', '').upper()
-                file_extension = recording.get('file_extension', '').upper()
-                
-                # Determine the appropriate folder and filename based on file type
-                if file_type == 'MP4':
-                    folder = 'videos'
-                    filename = f"{meeting_topic}-video"
-                elif file_type == 'M4A':
-                    folder = 'audio'
-                    filename = f"{meeting_topic}-audio"
-                elif file_type == 'CHAT':
-                    folder = 'chat'
-                    filename = f"{meeting_topic}-chat"
-                else:
-                    folder = 'other'
-                    filename = f"{meeting_topic}-other"
-                
-                # Clean the filename to remove any invalid characters
-                filename = "".join(c for c in filename if c.isalnum() or c in (' ', '-', '_')).strip()
-                filename = filename.replace(' ', '-')
-                
-                # Generate file path with type-specific folder and topic-based filename
-                file_path = f"recordings/{meeting.get('uuid', '')}/{folder}/{filename}{file_extension.lower()}"
-                
-                db_recording = Recording(
-                    meeting_id=db_meeting.id,
-                    recording_id=recording_id,
-                    topic=meeting_topic,
-                    host_name=host_name,
-                    file_type=file_type,
-                    file_extension=file_extension,
-                    file_size=recording.get('file_size', 0),
-                    recording_start=datetime.fromisoformat(recording.get('recording_start', '').replace("Z", "+00:00")),
-                    recording_end=datetime.fromisoformat(recording.get('recording_end', '').replace("Z", "+00:00")),
-                    recording_type=recording.get('recording_type', 'shared_screen_with_speaker_view'),
-                    file_path=file_path,
-                    status='pending'
-                )
-                db.add(db_recording)
-                db.commit()
-                logger.info(f"Added new recording to database: {recording_id}")
-                
-                # Now check if file exists in S3 and upload if needed
-                s3_key = db_recording.file_path
-                logger.info(f"Processing file with type: {file_type} and extension: {file_extension}")
-                
-                if not s3_uploader.check_file_exists(os.getenv('AWS_BUCKET_NAME'), s3_key):
-                    try:
-                        # Download recording using S3 uploader
-                        download_url = recording.get('download_url')
-                        if not download_url:
-                            logger.warning(f"No download URL found for recording: {recording_id}")
-                            continue
-
-                        # Add access token to download URL
-                        download_url = f"{download_url}?access_token={access_token}"
-                        logger.info(f"Downloading recording: {recording_id}")
-                        
-                        # Download the recording
-                        downloaded_file = s3_uploader.download_zoom_recording(download_url)
-                        if downloaded_file:
-                            logger.info(f"Successfully downloaded recording: {recording_id}")
-                            
-                            try:
-                                # Upload to S3
-                                logger.info(f"Uploading recording to S3: {recording_id}")
-                                s3_uploader.upload_to_s3(
-                                    bucket_name=os.getenv('AWS_BUCKET_NAME'),
-                                    file_path=downloaded_file,
-                                    recording_data=recording
-                                )
-                                logger.info(f"Successfully uploaded to S3: {s3_key}")
-                                
-                                # Update recording status to completed
-                                db_recording.status = 'completed'
-                                db.commit()
-                                logger.info(f"Updated recording status to completed: {recording_id}")
-                                
-                                processed_recordings.append({
-                                    'id': recording_id,
-                                    'topic': meeting_topic,
-                                    'status': 'processed',
-                                    'file_type': file_type
-                                })
-                                
-                            finally:
-                                # Clean up downloaded file
-                                if os.path.exists(downloaded_file):
-                                    logger.info(f"Cleaning up downloaded file: {downloaded_file}")
-                                    os.remove(downloaded_file)
-                                    logger.info(f"Cleaned up downloaded file: {downloaded_file}")
-                    except Exception as e:
-                        logger.error(f"Error processing recording {recording_id}: {str(e)}")
-                        db_recording.status = 'error'
-                        db_recording.error_message = str(e)
-                        db.commit()
-                        raise
-                else:
-                    # File exists in S3, update status to completed
-                    db_recording.status = 'completed'
-                    db.commit()
-                    logger.info(f"Recording {recording_id} already exists in S3, updated status to completed")
-                    processed_recordings.append({
-                        'id': recording_id,
-                        'topic': meeting_topic,
-                        'status': 'processed',
-                        'file_type': file_type
-                    })
+                    
+                result = process_recording_file(recording, meeting, host_name, access_token, db, s3_uploader)
+                if result['status'] == 'processed':
+                    processed_recordings.append(result)
+                elif result['status'] == 'skipped':
+                    skipped_recordings.append(result)
         
-        logger.info(f"Successfully processed {len(processed_recordings)} new recordings, skipped {len(skipped_recordings)} existing recordings")
         return {
             "message": f"Processed {len(processed_recordings)} new recordings, skipped {len(skipped_recordings)} existing recordings",
             "processed_recordings": processed_recordings,
@@ -981,24 +954,18 @@ class ZoomWebhookPayload(BaseModel):
 
 @app.post("/api/webhooks/zoom")
 async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
-    """Handle Zoom webhook notifications"""
     try:
-        # Get the webhook secret from environment variables
+        # Verify webhook signature
         webhook_secret = os.getenv('ZOOM_WEBHOOK_SECRET')
         if not webhook_secret:
-            logger.error("ZOOM_WEBHOOK_SECRET not configured")
             raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
-        # Get the request body
         body = await request.body()
-        
-        # Get the Zoom webhook signature
         signature = request.headers.get('x-zm-signature')
         if not signature:
-            logger.error("No signature found in webhook request")
             raise HTTPException(status_code=401, detail="No signature found")
 
-        # Verify the webhook signature
+        # Verify signature
         timestamp = signature.split('&')[0].split('=')[1]
         expected_signature = hmac.new(
             webhook_secret.encode('utf-8'),
@@ -1007,143 +974,32 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
         ).hexdigest()
         
         if signature.split('&')[1].split('=')[1] != expected_signature:
-            logger.error("Invalid webhook signature")
             raise HTTPException(status_code=401, detail="Invalid signature")
 
-        # Parse the webhook payload
         webhook_data = await request.json()
         logger.info(f"Received webhook: {webhook_data}")
 
-        # Check if this is a recording completed event
         if webhook_data.get('event') == 'recording.completed':
             payload = webhook_data.get('payload', {})
             object = payload.get('object', {})
             
-            # Extract meeting details
-            meeting_id = str(object.get('id'))
-            meeting_topic = object.get('topic')
-            host_id = object.get('host_id')
-            
-            logger.info(f"Processing completed recording for meeting: {meeting_topic} (ID: {meeting_id})")
-            
-            # Get access token for Zoom API
+            # Get access token
             access_token = get_access_token()
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
             
             # Get host information
+            host_id = object.get('host_id')
             host_info = get_host_info(host_id, access_token)
-            if host_info:
-                host_name = f"{host_info.get('first_name', '')} {host_info.get('last_name', '')}".strip()
-                logger.info(f"Host name from Zoom API: {host_name}")
-            else:
-                host_name = object.get('host_name', 'Unknown')
-                logger.warning(f"Could not get host info, using fallback: {host_name}")
+            host_name = f"{host_info.get('first_name', '')} {host_info.get('last_name', '')}".strip() if host_info else object.get('host_name', 'Unknown')
             
-            # Create or update meeting in database
-            db_meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
-            if not db_meeting:
-                logger.info(f"Creating new meeting record: {meeting_topic}")
-                db_meeting = Meeting(
-                    meeting_id=meeting_id,
-                    topic=meeting_topic,
-                    host_id=host_id,
-                    start_time=datetime.fromisoformat(object.get('start_time', '').replace("Z", "+00:00")),
-                    uuid=object.get('uuid', '')
-                )
-                db.add(db_meeting)
-                db.commit()
-                db.refresh(db_meeting)
-                logger.info(f"Created new meeting record: {meeting_topic}")
-            
-            # Process recording files
+            # Process each recording file
             recording_files = object.get('recording_files', [])
             for recording in recording_files:
                 if recording.get('status') != 'completed':
                     continue
-                
-                recording_id = recording.get('id', '')
-                
-                # Check if recording already exists
-                existing_recording = db.query(Recording).filter(Recording.recording_id == recording_id).first()
-                if existing_recording:
-                    logger.info(f"Recording {recording_id} already exists in database, skipping...")
-                    continue
-                
-                # Process the recording (reuse the existing recording processing logic)
-                file_type = recording.get('file_type', '').upper()
-                file_extension = recording.get('file_extension', '').upper()
-                
-                # Determine folder and filename
-                if file_type == 'MP4':
-                    folder = 'videos'
-                    filename = f"{meeting_topic}-video"
-                elif file_type == 'M4A':
-                    folder = 'audio'
-                    filename = f"{meeting_topic}-audio"
-                elif file_type == 'CHAT':
-                    folder = 'chat'
-                    filename = f"{meeting_topic}-chat"
-                else:
-                    folder = 'other'
-                    filename = f"{meeting_topic}-other"
-                
-                # Clean filename
-                filename = "".join(c for c in filename if c.isalnum() or c in (' ', '-', '_')).strip()
-                filename = filename.replace(' ', '-')
-                
-                # Generate file path
-                file_path = f"recordings/{object.get('uuid', '')}/{folder}/{filename}{file_extension.lower()}"
-                
-                # Create recording record
-                db_recording = Recording(
-                    meeting_id=db_meeting.id,
-                    recording_id=recording_id,
-                    topic=meeting_topic,
-                    host_name=host_name,
-                    file_type=file_type,
-                    file_extension=file_extension,
-                    file_size=recording.get('file_size', 0),
-                    recording_start=datetime.fromisoformat(recording.get('recording_start', '').replace("Z", "+00:00")),
-                    recording_end=datetime.fromisoformat(recording.get('recording_end', '').replace("Z", "+00:00")),
-                    recording_type=recording.get('recording_type', 'shared_screen_with_speaker_view'),
-                    file_path=file_path,
-                    status='pending'
-                )
-                db.add(db_recording)
-                db.commit()
-                
-                # Process the recording file
-                try:
-                    download_url = recording.get('download_url')
-                    if not download_url:
-                        continue
-
-                    download_url = f"{download_url}?access_token={access_token}"
-                    downloaded_file = s3_uploader.download_zoom_recording(download_url)
                     
-                    if downloaded_file:
-                        s3_uploader.upload_to_s3(
-                            bucket_name=os.getenv('AWS_BUCKET_NAME'),
-                            file_path=downloaded_file,
-                            recording_data=recording
-                        )
-                        db_recording.status = 'completed'
-                        db.commit()
-                        
-                        if os.path.exists(downloaded_file):
-                            os.remove(downloaded_file)
-                            
-                except Exception as e:
-                    logger.error(f"Error processing recording {recording_id}: {str(e)}")
-                    db_recording.status = 'error'
-                    db_recording.error_message = str(e)
-                    db.commit()
-                    continue
+                result = process_recording_file(recording, object, host_name, access_token, db, s3_uploader)
+                logger.info(f"Processed recording: {result}")
             
-            logger.info(f"Successfully processed recording for meeting: {meeting_topic}")
             return {"message": "Recording processed successfully"}
         
         return {"message": "Webhook received but not a recording completion event"}
