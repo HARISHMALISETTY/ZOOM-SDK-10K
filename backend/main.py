@@ -19,6 +19,7 @@ import jwt
 import hmac
 import hashlib
 import base64
+import json
 
 # Configure logging first
 logging.basicConfig(
@@ -955,12 +956,27 @@ class ZoomWebhookPayload(BaseModel):
 @app.post("/api/webhooks/zoom")
 async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
     try:
-        # Verify webhook signature
+        # Get the request body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        
+        # Check for Zoom's validation request
+        if body_str == '{"event":"endpoint.url_validation"}':
+            # This is a validation request from Zoom
+            return {
+                "plainToken": "plainToken",
+                "encryptedToken": hmac.new(
+                    os.getenv('ZOOM_WEBHOOK_SECRET').encode('utf-8'),
+                    "plainToken".encode('utf-8'),
+                    hashlib.sha256
+                ).hexdigest()
+            }
+
+        # Verify webhook signature for actual webhook events
         webhook_secret = os.getenv('ZOOM_WEBHOOK_SECRET')
         if not webhook_secret:
             raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
-        body = await request.body()
         signature = request.headers.get('x-zm-signature')
         if not signature:
             raise HTTPException(status_code=401, detail="No signature found")
@@ -969,14 +985,14 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
         timestamp = signature.split('&')[0].split('=')[1]
         expected_signature = hmac.new(
             webhook_secret.encode('utf-8'),
-            f"{timestamp}&{body.decode('utf-8')}".encode('utf-8'),
+            f"{timestamp}&{body_str}".encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
         
         if signature.split('&')[1].split('=')[1] != expected_signature:
             raise HTTPException(status_code=401, detail="Invalid signature")
 
-        webhook_data = await request.json()
+        webhook_data = json.loads(body_str)
         logger.info(f"Received webhook: {webhook_data}")
 
         if webhook_data.get('event') == 'recording.completed':
