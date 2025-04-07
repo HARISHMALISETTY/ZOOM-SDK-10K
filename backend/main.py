@@ -972,32 +972,42 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
             logger.error("Webhook secret not configured in environment variables")
             raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
-        # Get request signature
+        # Get request signature and timestamp
         signature = request.headers.get('x-zm-signature')
-        if not signature:
-            logger.error("No Zoom signature found in request headers")
+        timestamp = request.headers.get('x-zm-request-timestamp')
+        
+        if not signature or not timestamp:
+            logger.error("Missing required headers")
             logger.info("Available headers: " + ", ".join(request.headers.keys()))
-            raise HTTPException(status_code=401, detail="No signature found")
+            raise HTTPException(status_code=401, detail="Missing required headers")
 
         logger.info(f"Received signature: {signature}")
+        logger.info(f"Received timestamp: {timestamp}")
         
         # Verify signature
         try:
-            timestamp = signature.split('&')[0].split('=')[1]
-            logger.info(f"Extracted timestamp: {timestamp}")
+            # Remove 'v0=' prefix from signature
+            if not signature.startswith('v0='):
+                logger.error("Invalid signature format")
+                raise HTTPException(status_code=401, detail="Invalid signature format")
             
-            message = f"{timestamp}&{body.decode('utf-8')}"
+            received_hash = signature[3:]  # Remove 'v0=' prefix
+            
+            # Construct message to hash
+            message = f"v0:{timestamp}:{body.decode('utf-8')}"
             logger.info(f"Message to hash: {message}")
             
-            expected_signature = hmac.new(
+            # Generate expected hash
+            expected_hash = hmac.new(
                 webhook_secret.encode('utf-8'),
                 message.encode('utf-8'),
                 hashlib.sha256
             ).hexdigest()
-            logger.info(f"Expected signature: {expected_signature}")
-            logger.info(f"Received signature hash: {signature.split('&')[1].split('=')[1]}")
             
-            if signature.split('&')[1].split('=')[1] != expected_signature:
+            logger.info(f"Expected hash: {expected_hash}")
+            logger.info(f"Received hash: {received_hash}")
+            
+            if received_hash != expected_hash:
                 logger.error("Signature verification failed")
                 raise HTTPException(status_code=401, detail="Invalid signature")
             
