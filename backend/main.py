@@ -19,6 +19,9 @@ import jwt
 import hmac
 import hashlib
 import base64
+import shutil
+import subprocess
+import threading
 
 # Configure logging first
 logging.basicConfig(
@@ -585,7 +588,7 @@ def sync_meetings_from_zoom(db: Session = Depends(get_db)):
         
         # Get access token
         access_token = get_access_token()
-        logger.info("Successfully obtained access token")
+        logger.info("Successfully obtained access ttoken- for syncing meetings")
         
         # Get user info
         user_response = requests.get(
@@ -955,31 +958,95 @@ class ZoomWebhookPayload(BaseModel):
 @app.post("/api/webhooks/zoom")
 async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
     try:
-        # Verify webhook signature
+        # Log all request headers
+        logger.info("=== Zoom Webhook Request Received ===")
+        logger.info(f"Headers: {dict(request.headers)}")
+        
+        # Get and log the raw body
+        body = await request.body()
+        logger.info(f"Raw Body: {body.decode('utf-8')}")
+
+        # Verify webhook secret exists
         webhook_secret = os.getenv('ZOOM_WEBHOOK_SECRET')
         if not webhook_secret:
+            logger.error("Webhook secret not configured in environment variables")
             raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
-        body = await request.body()
+        # Get request signature
         signature = request.headers.get('x-zm-signature')
         if not signature:
+            logger.error("No Zoom signature found in request headers")
+            logger.info("Available headers: " + ", ".join(request.headers.keys()))
             raise HTTPException(status_code=401, detail="No signature found")
 
-        # Verify signature
-        timestamp = signature.split('&')[0].split('=')[1]
-        expected_signature = hmac.new(
-            webhook_secret.encode('utf-8'),
-            f"{timestamp}&{body.decode('utf-8')}".encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
+        logger.info(f"Received signature: {signature}")
         
-        if signature.split('&')[1].split('=')[1] != expected_signature:
-            raise HTTPException(status_code=401, detail="Invalid signature")
+        # Verify signature
+        try:
+            timestamp = signature.split('&')[0].split('=')[1]
+            logger.info(f"Extracted timestamp: {timestamp}")
+            
+            message = f"{timestamp}&{body.decode('utf-8')}"
+            logger.info(f"Message to hash: {message}")
+            
+            expected_signature = hmac.new(
+                webhook_secret.encode('utf-8'),
+                message.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            logger.info(f"Expected signature: {expected_signature}")
+            logger.info(f"Received signature hash: {signature.split('&')[1].split('=')[1]}")
+            
+            if signature.split('&')[1].split('=')[1] != expected_signature:
+                logger.error("Signature verification failed")
+                raise HTTPException(status_code=401, detail="Invalid signature")
+            
+            logger.info("Signature verification successful")
+        except Exception as e:
+            logger.error(f"Error during signature verification: {str(e)}")
+            raise HTTPException(status_code=401, detail=f"Signature verification error: {str(e)}")
 
+        # Parse and log the webhook data
         webhook_data = await request.json()
-        logger.info(f"Received webhook: {webhook_data}")
+        logger.info(f"Webhook data: {webhook_data}")
+        logger.info(f"Event type: {webhook_data.get('event')}")
 
+        # Handle validation request
+        if webhook_data.get('event') == 'endpoint.url_validation':
+            logger.info("Received URL validation request")
+            try:
+                plainToken = webhook_data.get('payload', {}).get('plainToken')
+                logger.info(f"Plain token received: {plainToken}")
+                
+                if not plainToken:
+                    logger.error("No plain token found in validation request")
+                    raise HTTPException(status_code=400, detail="No plain token provided")
+                
+                # Generate hash validation
+                hash_value = hmac.new(
+                    webhook_secret.encode('utf-8'),
+                    plainToken.encode('utf-8'),
+                    hashlib.sha256
+                ).hexdigest()
+                
+                logger.info(f"Generated hash for validation: {hash_value}")
+                
+                # Return the expected response format
+                response = {
+                    "plainToken": plainToken,
+                    "encryptedToken": hash_value
+                }
+                
+                logger.info(f"Sending validation response: {response}")
+                return response
+                
+            except Exception as e:
+                logger.error(f"Error processing validation request: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Validation processing error: {str(e)}")
+
+        # Handle recording.completed event
         if webhook_data.get('event') == 'recording.completed':
+            logger.info("Processing recording.completed event")
             payload = webhook_data.get('payload', {})
             object = payload.get('object', {})
             
@@ -993,8 +1060,11 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
             
             # Process each recording file
             recording_files = object.get('recording_files', [])
+            logger.info(f"Found {len(recording_files)} recording files to process")
+            
             for recording in recording_files:
                 if recording.get('status') != 'completed':
+                    logger.info(f"Skipping recording {recording.get('id')} - status not completed")
                     continue
                     
                 result = process_recording_file(recording, object, host_name, access_token, db, s3_uploader)
@@ -1002,7 +1072,8 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
             
             return {"message": "Recording processed successfully"}
         
-        return {"message": "Webhook received but not a recording completion event"}
+        logger.info("Webhook processed successfully")
+        return {"message": "Webhook processed successfully"}
         
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}")
@@ -1067,25 +1138,6 @@ async def test_webhook(db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
-    import subprocess
-    import threading
-    import time
-    
-    def start_ngrok():
-        try:
-            # Start ngrok in a separate process
-            subprocess.run(['ngrok', 'http', '8001'])
-        except Exception as e:
-            logger.error(f"Error starting ngrok: {str(e)}")
-    
-    # Start ngrok in a separate thread
-    ngrok_thread = threading.Thread(target=start_ngrok)
-    ngrok_thread.daemon = True  # This ensures the thread will be killed when the main program exits
-    ngrok_thread.start()
-    
-    # Give ngrok a moment to start
-    time.sleep(2)
-    
     # Start the FastAPI server
     logger.info("Starting Zoom Recordings API server")
     uvicorn.run(app, host="0.0.0.0", port=8001) 

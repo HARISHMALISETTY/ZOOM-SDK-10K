@@ -34,6 +34,7 @@ import VideocamIcon from "@mui/icons-material/Videocam";
 import EditIcon from "@mui/icons-material/Edit";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import { format, isBefore, differenceInMinutes } from "date-fns";
+import RefreshIcon from "@mui/icons-material/Refresh";
 
 const ScheduleMeeting = () => {
   const [DIALOG_OPEN, setOpen] = useState(false);
@@ -59,6 +60,7 @@ const ScheduleMeeting = () => {
   const [selectedMeeting, setSelectedMeeting] = useState(null);
   const [reminders, setReminders] = useState([]);
   const [meetingStatuses, setMeetingStatuses] = useState({});
+  const [isLoadingStatus, setIsLoadingStatus] = useState(false);
 
   // Function to sync meetings from Zoom
   const syncMeetingsFromZoom = async () => {
@@ -148,12 +150,13 @@ const ScheduleMeeting = () => {
     }
   };
 
-  const updateMeetingStatuses = async () => {
+  const fetchMeetingStatuses = async () => {
+    setIsLoadingStatus(true);
     const statuses = {};
     for (const meeting of scheduledMeetings) {
       try {
         const response = await fetch(
-          `http://localhost:8001/api/meetings/${meeting.meeting_id}/status`
+          `${import.meta.env.VITE_BACKEND_URL}/api/meetings/${meeting.meeting_id}/status`
         );
         if (response.ok) {
           const data = await response.json();
@@ -167,6 +170,7 @@ const ScheduleMeeting = () => {
       }
     }
     setMeetingStatuses(statuses);
+    setIsLoadingStatus(false);
   };
 
   const checkReminders = () => {
@@ -275,7 +279,7 @@ const ScheduleMeeting = () => {
   const getMeetingStatus = (meeting) => {
     const status = meetingStatuses[meeting.meeting_id];
     if (!status) {
-      return { label: "Loading...", color: "default" };
+      return { label: "Click Refresh to get status", color: "default" };
     }
 
     if (status.is_active) {
@@ -411,9 +415,20 @@ const ScheduleMeeting = () => {
 
       {/* Scheduled Meetings Table */}
       <Paper elevation={3} sx={{ p: 4, mt: 4 }}>
-        <Typography variant="h5" component="h2" gutterBottom>
-          Scheduled Meetings
-        </Typography>
+        <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
+          <Typography variant="h5" component="h2">
+            Scheduled Meetings
+          </Typography>
+          <Button
+            variant="contained"
+            color="primary"
+            onClick={fetchMeetingStatuses}
+            disabled={isLoadingStatus}
+            startIcon={<RefreshIcon />}
+          >
+            {isLoadingStatus ? "Refreshing..." : "Refresh Status"}
+          </Button>
+        </Box>
         <TableContainer>
           <Table>
             <TableHead>
@@ -442,35 +457,14 @@ const ScheduleMeeting = () => {
                         />
                       </TableCell>
                       <TableCell>
-                        <Box sx={{ display: "flex", gap: 1 }}>
-                          {!isMeetingStarted(meeting.start_time) ? (
-                            <Tooltip title="Start Meeting">
-                              <IconButton
-                                color="primary"
-                                onClick={() => handleStartMeeting(meeting)}
-                              >
-                                <VideocamIcon />
-                              </IconButton>
-                            </Tooltip>
-                          ) : (
-                            <Tooltip title="Join Meeting">
-                              <IconButton
-                                color="primary"
-                                onClick={() => handleStartMeeting(meeting)}
-                              >
-                                <PlayArrowIcon />
-                              </IconButton>
-                            </Tooltip>
-                          )}
-                          <Tooltip title="Edit Meeting">
-                            <IconButton
-                              color="primary"
-                              onClick={() => handleEditMeeting(meeting)}
-                            >
-                              <EditIcon />
-                            </IconButton>
-                          </Tooltip>
-                        </Box>
+                        <Button
+                          variant="contained"
+                          color="primary"
+                          onClick={() => handleStartMeeting(meeting)}
+                          disabled={!isMeetingStarted(meeting.start_time)}
+                        >
+                          Start Meeting
+                        </Button>
                       </TableCell>
                     </TableRow>
                   );

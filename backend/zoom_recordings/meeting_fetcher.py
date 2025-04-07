@@ -65,7 +65,7 @@ class ZoomMeetingFetcher:
         )
         
         if response.status_code == 200:
-            logging.info("Successfully obtained access token")
+            # logging.info("Successfully obtained access token")
             return response.json()['access_token']
         else:
             error_msg = f"Failed to obtain access token: {response.text}"
