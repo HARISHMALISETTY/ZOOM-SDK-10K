@@ -25,6 +25,7 @@ function App() {
         <div className="app">
           <Navbar />
           <main className="main-content">
+            
             <Routes>
               <Route path="/" element={<Dashboard />} />
               <Route path="/recordings" element={<RecordingsList />} />

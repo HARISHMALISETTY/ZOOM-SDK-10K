@@ -8,6 +8,7 @@ from config import settings
 import os
 from dotenv import load_dotenv
 from s3_uploader import ZoomRecordingS3Uploader
+from cloud_video_processor import CloudVideoProcessor
 from sqlalchemy.orm import Session
 from database import get_db, engine
 from models import Base, Meeting, Recording
@@ -22,6 +23,8 @@ import base64
 import shutil
 import subprocess
 import threading
+from media_converter import MediaConvertProcessor
+from botocore.exceptions import ClientError
 
 # Configure logging first
 logging.basicConfig(
@@ -75,9 +78,21 @@ s3_uploader = ZoomRecordingS3Uploader(
 )
 logger.info("Initialized S3 uploader")
 
+# Initialize cloud video processor
+cloud_processor = CloudVideoProcessor(
+    aws_access_key=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION')
+)
+logger.info("Initialized cloud video processor")
+
+# Initialize MediaConvert processor
+media_converter = MediaConvertProcessor()
+
 # AWS S3 Config
 AWS_BUCKET_NAME = os.getenv("AWS_BUCKET_NAME")
 AWS_REGION = os.getenv("AWS_REGION")
+AWS_STREAMING_BUCKET = os.getenv("AWS_STREAMING_BUCKET")
 
 # S3 Client
 s3_client = boto3.client(
@@ -204,7 +219,7 @@ async def get_recordings_stats(db: Session = Depends(get_db)):
             func.count(Recording.id).label('count')
         ).group_by(Recording.topic).all()
         
-        logger.info(f"Stats calculated: {total_recordings} recordings, {total_storage} bytes storage, {total_hosts} hosts")
+        # logger.info(f"Stats calculated: {total_recordings} recordings, {total_storage} bytes storage, {total_hosts} hosts")
         
         return {
             "totalRecordings": total_recordings,
@@ -241,6 +256,15 @@ def process_recording_file(recording: dict, meeting: dict, host_name: str, acces
         recording_id = recording.get('id', '')
         meeting_topic = meeting.get('topic', '')
         meeting_id = str(meeting.get('id', ''))
+        
+        if not meeting_id:
+            logger.error(f"No meeting ID found for recording {recording_id}")
+            return {
+                'id': recording_id,
+                'topic': meeting_topic,
+                'status': 'error',
+                'error': 'No meeting ID found'
+            }
         
         # Check if recording already exists
         existing_recording = db.query(Recording).filter(Recording.recording_id == recording_id).first()
@@ -281,6 +305,8 @@ def process_recording_file(recording: dict, meeting: dict, host_name: str, acces
             recording_end=datetime.fromisoformat(recording.get('recording_end', '').replace("Z", "+00:00")),
             recording_type=recording.get('recording_type', 'shared_screen_with_speaker_view'),
             file_path=f"recordings/{meeting.get('uuid', '')}/{recording_id}.mp4",
+            streaming_path=f"outputs/recordings/{meeting.get('uuid', '')}/{recording_id}",
+            quality_variants="1080p,720p,480p",
             status='pending'
         )
         db.add(db_recording)
@@ -309,15 +335,12 @@ def process_recording_file(recording: dict, meeting: dict, host_name: str, acces
                 
                 downloaded_file = s3_uploader.download_zoom_recording(download_url)
                 if downloaded_file:
-                    logger.info(f"Successfully downloaded recording: {recording_id}")
-                    
                     try:
                         s3_uploader.upload_to_s3(
                             bucket_name=os.getenv('AWS_BUCKET_NAME'),
                             file_path=downloaded_file,
                             recording_data=recording
                         )
-                        logger.info(f"Successfully uploaded to S3: {s3_key}")
                         
                         db_recording.status = 'completed'
                         db.commit()
@@ -355,7 +378,6 @@ def process_recording_file(recording: dict, meeting: dict, host_name: str, acces
             else:
                 db_recording.status = 'completed'
                 db.commit()
-                logger.info(f"Recording {recording_id} already exists in S3, updated status to completed")
                 return {
                     'id': recording_id,
                     'topic': meeting_topic,
@@ -487,6 +509,171 @@ def get_signed_url(recording_id: str, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error generating pre-signed URL for recording {recording_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating pre-signed URL: {str(e)}")
+
+@app.get("/api/recordings/get-stream-url/{recording_id}")
+async def get_recording_stream_url(recording_id: str, db: Session = Depends(get_db)):
+    try:
+        # Get recording from database
+        recording = db.query(Recording).filter(Recording.recording_id == recording_id).first()
+        if not recording:
+            raise HTTPException(status_code=404, detail="Recording not found")
+            
+        # If recording failed processing, return error
+        if recording.status == 'error':
+            return {
+                "status": "error",
+                "message": recording.error_message
+            }
+            
+        # Check for HLS stream in streaming bucket
+        try:
+            # Construct the correct HLS paths
+            base_path = f"{recording.streaming_path}.mp4/{recording.recording_id}"
+            master_manifest = f"{base_path}.m3u8"
+            quality_variants = recording.quality_variants.split(',') if recording.quality_variants else []
+            
+            logger.info(f"Checking for HLS stream at: {master_manifest}")
+            
+            # Try streaming bucket first
+            try:
+                s3_client.head_object(
+                    Bucket=AWS_STREAMING_BUCKET,
+                    Key=master_manifest
+                )
+                
+                # Generate signed URLs for master manifest and all quality variants
+                signed_urls = {}
+                
+                # Master manifest - use raw S3 key without URL encoding
+                master_manifest_key = master_manifest
+                signed_urls['master'] = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': AWS_STREAMING_BUCKET,
+                        'Key': master_manifest_key
+                    },
+                    ExpiresIn=3600
+                )
+                
+                # Quality variants - use raw S3 keys without URL encoding
+                for quality in quality_variants:
+                    variant_key = f"{base_path}_{quality}.m3u8"
+                    signed_urls[quality] = s3_client.generate_presigned_url(
+                        'get_object',
+                        Params={
+                            'Bucket': AWS_STREAMING_BUCKET,
+                            'Key': variant_key
+                        },
+                        ExpiresIn=3600
+                    )
+                
+                # Generate signed URLs for segment files
+                for quality in quality_variants:
+                    # Create the segment key without encoding
+                    segment_key = f"{base_path}_{quality}_00001.ts"
+                    # Generate the signed URL
+                    signed_urls[f'segment_{quality}'] = s3_client.generate_presigned_url(
+                        'get_object',
+                        Params={
+                            'Bucket': AWS_STREAMING_BUCKET,
+                            'Key': segment_key
+                        },
+                        ExpiresIn=3600
+                    )
+                
+                logger.info(f"Found HLS stream at: {signed_urls['master']}")
+                return {
+                    "status": "success",
+                    "url": signed_urls['master'],
+                    "type": "hls",
+                    "quality_variants": recording.quality_variants,
+                    "signed_urls": signed_urls
+                }
+            except Exception as e:
+                logger.warning(f"HLS stream not found in streaming bucket: {str(e)}")
+                
+            # Try original bucket as fallback
+            try:
+                s3_client.head_object(
+                    Bucket=AWS_BUCKET_NAME,
+                    Key=master_manifest
+                )
+                
+                # Generate signed URLs for master manifest and all quality variants
+                signed_urls = {}
+                
+                # Master manifest
+                signed_urls['master'] = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': AWS_BUCKET_NAME,
+                        'Key': master_manifest
+                    },
+                    ExpiresIn=3600
+                )
+                
+                # Quality variants
+                for quality in quality_variants:
+                    variant_key = f"{base_path}_{quality}.m3u8"
+                    signed_urls[quality] = s3_client.generate_presigned_url(
+                        'get_object',
+                        Params={
+                            'Bucket': AWS_BUCKET_NAME,
+                            'Key': variant_key
+                        },
+                        ExpiresIn=3600
+                    )
+                    
+                # Generate a signed URL for segment files
+                # We'll use a wildcard pattern that matches any .ts file in the recording directory
+                segment_pattern = f"{base_path}_*.ts"
+                signed_urls['segments'] = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': AWS_BUCKET_NAME,
+                        'Key': segment_pattern
+                    },
+                    ExpiresIn=3600
+                )
+                
+                logger.info(f"Found HLS stream in original bucket at: {signed_urls['master']}")
+                return {
+                    "status": "success",
+                    "url": signed_urls['master'],
+                    "type": "hls",
+                    "quality_variants": recording.quality_variants,
+                    "signed_urls": signed_urls
+                }
+            except Exception as e:
+                logger.warning(f"HLS stream not found in original bucket: {str(e)}")
+                
+        except Exception as e:
+            logger.error(f"Error checking HLS stream: {str(e)}")
+            
+        # Fallback to MP4 if no HLS stream found
+        try:
+            mp4_key = recording.file_path
+            mp4_url = s3_client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': AWS_BUCKET_NAME,
+                    'Key': mp4_key
+                },
+                ExpiresIn=3600
+            )
+            logger.info(f"Using MP4 fallback at: {mp4_url}")
+            return {
+                "status": "success",
+                "url": mp4_url,
+                "type": "mp4"
+            }
+        except Exception as e:
+            logger.error(f"Error generating MP4 URL: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to generate video URL")
+            
+    except Exception as e:
+        logger.error(f"Error getting stream URL: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 class MeetingSchedule(BaseModel):
     topic: str
@@ -956,7 +1143,7 @@ class ZoomWebhookPayload(BaseModel):
     payload: dict
 
 @app.post("/api/webhooks/zoom")
-async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
+async def zoom_webhook(request: Request):
     try:
         # Log all request headers
         logger.info("=== Zoom Webhook Request Received ===")
@@ -983,7 +1170,7 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
 
         logger.info(f"Received signature: {signature}")
         logger.info(f"Received timestamp: {timestamp}")
-        
+
         # Verify signature
         try:
             # Remove 'v0=' prefix from signature
@@ -999,18 +1186,18 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
             
             # Generate expected hash
             expected_hash = hmac.new(
-                webhook_secret.encode('utf-8'),
+            webhook_secret.encode('utf-8'),
                 message.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
+            hashlib.sha256
+        ).hexdigest()
+        
             logger.info(f"Expected hash: {expected_hash}")
             logger.info(f"Received hash: {received_hash}")
             
             if received_hash != expected_hash:
                 logger.error("Signature verification failed")
-                raise HTTPException(status_code=401, detail="Invalid signature")
-            
+            raise HTTPException(status_code=401, detail="Invalid signature")
+
             logger.info("Signature verification successful")
         except Exception as e:
             logger.error(f"Error during signature verification: {str(e)}")
@@ -1058,29 +1245,123 @@ async def zoom_webhook(request: Request, db: Session = Depends(get_db)):
         if webhook_data.get('event') == 'recording.completed':
             logger.info("Processing recording.completed event")
             payload = webhook_data.get('payload', {})
-            object = payload.get('object', {})
-            
-            # Get access token
-            access_token = get_access_token()
-            
-            # Get host information
-            host_id = object.get('host_id')
-            host_info = get_host_info(host_id, access_token)
-            host_name = f"{host_info.get('first_name', '')} {host_info.get('last_name', '')}".strip() if host_info else object.get('host_name', 'Unknown')
+            object_data = payload.get('object', {})
             
             # Process each recording file
-            recording_files = object.get('recording_files', [])
+            recording_files = object_data.get('recording_files', [])
             logger.info(f"Found {len(recording_files)} recording files to process")
             
             for recording in recording_files:
-                if recording.get('status') != 'completed':
-                    logger.info(f"Skipping recording {recording.get('id')} - status not completed")
-                    continue
-                    
-                result = process_recording_file(recording, object, host_name, access_token, db, s3_uploader)
-                logger.info(f"Processed recording: {result}")
+                if recording.get('file_type') == 'MP4' and recording.get('status') == 'completed':
+                    try:
+                        # Get meeting ID from the recording
+                        meeting_id = recording.get('meeting_id')
+                        if not meeting_id:
+                            logger.error("No meeting ID found in recording")
+                            continue
+                        
+                        # Original file path in zoom-recordings bucket
+                        original_path = f"recordings/{object_data.get('uuid')}/{recording.get('id')}.mp4"
+                        
+                        # Streaming path in video-biterating bucket
+                        streaming_path = f"outputs/recordings/{object_data.get('uuid')}/{recording.get('id')}"
+                        
+                        # First, download and upload the recording
+                        download_url = recording.get('download_url')
+                        if not download_url:
+                            logger.warning(f"No download URL found for recording: {recording.get('id')}")
+                            continue
+                            
+                        download_url = f"{download_url}?access_token={get_access_token()}"
+                        logger.info(f"Downloading recording: {recording.get('id')}")
+                        
+                        downloaded_file = s3_uploader.download_zoom_recording(download_url)
+                        if not downloaded_file:
+                            logger.error(f"Failed to download recording: {recording.get('id')}")
+                            continue
+                            
+                        try:
+                            # Upload to S3
+                            s3_uploader.upload_to_s3(
+                                bucket_name=os.getenv('AWS_BUCKET_NAME'),
+                                file_path=downloaded_file,
+                                recording_data=recording
+                            )
+                            
+                            # Create MediaConvert job
+                            job_id = media_converter.create_job(original_path)
+                            logger.info(f"Started MediaConvert job {job_id} for file {original_path}")
+                            
+                            # Update database status
+                            db_recording = Recording(
+                                meeting_id=meeting_id,
+                                recording_id=recording.get('id'),
+                                topic=object_data.get('topic'),
+                                file_path=original_path,
+                                streaming_path=streaming_path,
+                                quality_variants="1080p,720p,480p",
+                                status='processing',
+                                mediaconvert_job_id=job_id,
+                                processing_start_time=datetime.utcnow()
+                            )
+                            db.add(db_recording)
+                            db.commit()
+                            
+                            # Start a background task to monitor job status
+                            def monitor_job_status(job_id, db_recording_id):
+                                try:
+                                    while True:
+                                        status = media_converter.get_job_status(job_id)
+                                        logger.info(f"Job {job_id} status: {status}")
+                                        
+                                        if status == 'COMPLETE':
+                                            with Session() as session:
+                                                recording = session.query(Recording).get(db_recording_id)
+                                                if recording:
+                                                    recording.status = 'completed'
+                                                    recording.quality_variants = "1080p,720p,480p"
+                                                    recording.processing_end_time = datetime.utcnow()
+                                                    session.commit()
+                                                    logger.info(f"Job {job_id} completed successfully")
+                                            break
+                                        elif status in ['ERROR', 'CANCELED']:
+                                            with Session() as session:
+                                                recording = session.query(Recording).get(db_recording_id)
+                                                if recording:
+                                                    recording.status = 'error'
+                                                    recording.error_message = f"MediaConvert job failed with status: {status}"
+                                                    session.commit()
+                                                    logger.error(f"Job {job_id} failed with status: {status}")
+                                            break
+                                        time.sleep(30)  # Check every 30 seconds
+                                except Exception as e:
+                                    logger.error(f"Error monitoring job {job_id}: {str(e)}")
+                                    with Session() as session:
+                                        recording = session.query(Recording).get(db_recording_id)
+                                        if recording:
+                                            recording.status = 'error'
+                                            recording.error_message = str(e)
+                                            session.commit()
+                            
+                            # Start monitoring in background thread
+                            thread = threading.Thread(
+                                target=monitor_job_status,
+                                args=(job_id, db_recording.id)
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            
+                        finally:
+                            # Clean up downloaded file
+                            if os.path.exists(downloaded_file):
+                                os.remove(downloaded_file)
+                                logger.info(f"Cleaned up downloaded file: {downloaded_file}")
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing recording {recording.get('id')}: {str(e)}")
+                        continue
             
-            return {"message": "Recording processed successfully"}
+            return {"message": "Recording processing started"}
         
         logger.info("Webhook processed successfully")
         return {"message": "Webhook processed successfully"}

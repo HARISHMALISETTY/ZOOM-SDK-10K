@@ -23,6 +23,7 @@ import {
 import PlayCircleOutlineIcon from "@mui/icons-material/PlayCircleOutline";
 import CloseIcon from "@mui/icons-material/Close";
 import RefreshIcon from "@mui/icons-material/Refresh";
+import VideoPlayer from '../components/VideoPlayer';
 
 const RecordingsList = () => {
   const [recordings, setRecordings] = useState([]);
@@ -37,32 +38,32 @@ const RecordingsList = () => {
 
   const fetchRecordings = async () => {
     try {
-      console.log("Fetching recordings from database...");
+      // console.log("Fetching recordings from database...");
       const response = await fetch("http://localhost:8001/api/recordings");
       if (!response.ok) {
         throw new Error("Failed to fetch recordings");
       }
       const data = await response.json();
-      console.log("Raw data from database:", data);
+      // console.log("Raw data from database:", data);
 
       // Log each recording's details
-      data.forEach((recording, index) => {
-        console.log(`\nRecording ${index + 1} Details:`);
-        console.log(recording);
-        console.log('Topic:', recording.topic);
-        console.log('Host Name:', recording.host_name);
-        console.log('File Size:', recording.file_size);
-        console.log('Created At:', recording.created_at);
-        console.log('Status:', recording.status);
-        console.log('----------------------------------------');
-      });
+      // data.forEach((recording, index) => {
+        // console.log(`\nRecording ${index + 1} Details:`);
+        // console.log(recording);
+        // console.log('Topic:', recording.topic);
+        // console.log('Host Name:', recording.host_name);
+        // console.log('File Size:', recording.file_size);
+        // console.log('Created At:', recording.created_at);
+        // console.log('Status:', recording.status);
+        // console.log('----------------------------------------');
+      // });
 
       // Only show completed recordings
       const completedRecordings = data.filter(
         (rec) => rec.status === "completed"
       );
-      console.log(`\nTotal recordings: ${data.length}`);
-      console.log(`Completed recordings: ${completedRecordings.length}`);
+      // console.log(`\nTotal recordings: ${data.length}`);
+      // console.log(`Completed recordings: ${completedRecordings.length}`);
 
       setRecordings(completedRecordings);
       setLoading(false);
@@ -103,12 +104,9 @@ const RecordingsList = () => {
         return;
       }
 
-      console.log(
-        "Fetching pre-signed URL for recording:",
-        recording.recording_id
-      );
+      console.log("Fetching stream URL for recording:", recording.recording_id);
       const response = await fetch(
-        `http://localhost:8001/api/recordings/get-signed-url/${recording.recording_id}`
+        `http://localhost:8001/api/recordings/get-stream-url/${recording.recording_id}`
       );
 
       if (!response.ok) {
@@ -116,11 +114,15 @@ const RecordingsList = () => {
       }
 
       const data = await response.json();
-      console.log("Received pre-signed URL:", data.presigned_url);
+      console.log("Received stream URL DATA:", data);
+      console.log("Received stream URL:", data.url);
+      console.log("Video type:", data.type);
 
       setSelectedRecording({
         ...recording,
-        video_url: data.presigned_url,
+        video_url: data.url,
+        video_type: data.type,
+        signed_urls: data.signed_urls
       });
       setOpenVideoDialog(true);
     } catch (error) {
@@ -230,15 +232,10 @@ const RecordingsList = () => {
         <DialogContent>
           {selectedRecording?.video_url && (
             <Box sx={{ width: "100%", mt: 2 }}>
-              <video
-                controls
-                style={{ width: "100%", maxHeight: "70vh" }}
-                preload="metadata"
-                playsInline
-              >
-                <source src={selectedRecording.video_url} type="video/mp4" />
-                Your browser does not support the video tag.
-              </video>
+              <VideoPlayer 
+                videoUrl={selectedRecording.video_url} 
+                signedUrls={selectedRecording.signed_urls}
+              />
               <Box sx={{ mt: 2 }}>
                 <Typography variant="body2" color="text.secondary">
                   Host: {selectedRecording.host_name || 'Unknown'}
@@ -247,7 +244,7 @@ const RecordingsList = () => {
                   File Size: {(selectedRecording.file_size / (1024 * 1024)).toFixed(2)} MB
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
-                  File Type: {selectedRecording.file_type}
+                  File Type: {selectedRecording.video_type}
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
                   Recording Start: {formatDate(selectedRecording.recording_start)}

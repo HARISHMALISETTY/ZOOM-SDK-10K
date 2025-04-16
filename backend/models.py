@@ -34,9 +34,14 @@ class Recording(Base):
     recording_start = Column(DateTime)  # Store recording start time
     recording_end = Column(DateTime)  # Store recording end time
     recording_type = Column(String)  # Store recording type
-    file_path = Column(String)  # Store S3 key as file path
-    status = Column(String, default='pending')
+    file_path = Column(String)  # Store original S3 key as file path
+    streaming_path = Column(String, nullable=True)  # Store HLS streaming path
+    mediaconvert_job_id = Column(String, nullable=True)  # Store MediaConvert job ID
+    status = Column(String, default='pending')  # pending, processing, completed, error
     error_message = Column(String, nullable=True)
+    quality_variants = Column(String, nullable=True)  # Store available quality variants (e.g., "1080p,720p,480p")
+    processing_start_time = Column(DateTime, nullable=True)  # When MediaConvert job started
+    processing_end_time = Column(DateTime, nullable=True)  # When MediaConvert job completed
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
